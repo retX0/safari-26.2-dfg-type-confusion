@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <style>
+        body {
+            font-family: monospace;
+        }
+    </style>
+</head>
+
+<body>
+    Here we go...<br />
+</body>
+<script src="logging.js"></script>
+<script>
+    function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+    function quit() { throw new Error("exploit aborted"); }
+</script>
+<script src="wasm_rw.js"></script>
+<script>
+    (async () => {
+        try {
+            let ok = await init_wasm_rw();
+            if (!ok) return;
+            print("\n=== AAR/AAW Primitives Ready ===");
+            print("[+] read32 / write32 / read64 / write64 available on window.*");
+            let demo = { hello: "world" };
+            print("[demo] addrof({hello:'world'}) = " + hex(addrof(demo)));
+            print("[demo] JSCell header = " + hex(read64(addrof(demo))));
+        } catch (e) {
+            print("[-] " + e.message);
+        }
+    })();
+</script>
+
+</html>

